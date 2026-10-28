@@ -183,13 +183,97 @@ def analyze(rows, time_col, num_cols):
     # 중요한 항목(기준이 있는 것)을 앞에 둔다
     rank = {k: i for i, (k, *_rest) in enumerate(METRICS)}
     metrics.sort(key=lambda m: rank.get(m["key"], 99))
-    return coverage, metrics
+    for m in metrics:
+        m["warning"] = warning_level(m)
+    co2 = next((m for m in metrics if m["key"] == "co2"), None)
+    ventilation = ventilation_plan(co2, coverage) if co2 else None
+    return coverage, metrics, ventilation
+
+
+# ---------------------------------------------------------------------------
+# 기준 초과 경고: 🔴 경고 / 🟠 주의 / 🟢 양호
+# ---------------------------------------------------------------------------
+CO2_ATTENTION = 800  # 기준(1,000ppm) 전에 미리 환기를 준비하는 선
+
+
+def warning_level(m):
+    if "out_of_range_pct" not in m:
+        return None
+    pct = m["out_of_range_pct"]
+    if pct >= 10:
+        return {"level": "경고", "icon": "🔴", "reason": f"측정 시간의 {pct}%가 기준을 벗어남"}
+    if pct > 0:
+        return {"level": "주의", "icon": "🟠", "reason": f"측정 시간의 {pct}%가 기준을 벗어남"}
+    if m["key"] == "co2":
+        near = sum(v >= CO2_ATTENTION for _, v in m["series"]) / max(len(m["series"]), 1) * 100
+        if near >= 10:
+            return {"level": "주의", "icon": "🟠",
+                    "reason": f"기준은 지켰지만 측정 시간의 {near:.0f}%가 {CO2_ATTENTION}ppm 이상 (기준에 가까움)"}
+    return {"level": "양호", "icon": "🟢", "reason": "측정 기간 내내 기준 안"}
+
+
+# ---------------------------------------------------------------------------
+# 환기 시간 제안: CO2가 오르는 속도와 시간대를 보고 언제·얼마마다 환기할지 계산
+# ---------------------------------------------------------------------------
+def ventilation_plan(m, coverage):
+    pts = [(datetime.fromisoformat(t), v) for t, v in m["series"]]
+    if len(pts) < 10:
+        return None
+    limit = m["limits"][1] or 1000
+    vals = sorted(v for _, v in pts)
+    baseline = vals[len(vals) // 10]  # 하위 10% 값 = 환기된(바깥 공기에 가까운) 상태로 본다
+    max_gap = max(coverage.get("interval_sec", 30) * 10, 300)
+
+    # 10분 동안 CO2가 얼마나 오르는지 (분당 ppm). 끊긴 구간은 건너뛴다.
+    slopes, j = [], 0
+    for i, (ti, vi) in enumerate(pts):
+        j = max(j, i)
+        while j + 1 < len(pts) and (pts[j][0] - ti).total_seconds() < 600:
+            if (pts[j + 1][0] - pts[j][0]).total_seconds() > max_gap:
+                break
+            j += 1
+        span = (pts[j][0] - ti).total_seconds() / 60
+        if span >= 8:
+            s = (pts[j][1] - vi) / span
+            if s > 1:  # 분당 1ppm 넘게 오를 때만 '사람이 있어 오르는 중'으로 본다
+                slopes.append(s)
+    rate = statistics.median(slopes) if slopes else None
+
+    # 날마다 처음 800ppm을 '5분 넘게 계속' 넘은 시각 (한두 번 튄 값은 무시)
+    first_cross, run_start, prev_t = {}, None, None
+    for t, v in pts:
+        if prev_t and (t - prev_t).total_seconds() > max_gap:
+            run_start = None
+        if v >= CO2_ATTENTION:
+            run_start = run_start or t
+            if (t - run_start).total_seconds() >= 300 and run_start.date() not in first_cross:
+                first_cross[run_start.date()] = run_start
+        else:
+            run_start = None
+        prev_t = t
+    cross_minutes = sorted(t.hour * 60 + t.minute for t in first_cross.values())
+    typical_cross = cross_minutes[len(cross_minutes) // 2] if cross_minutes else None
+
+    hourly = m["hourly_mean"]
+    plan = {
+        "baseline_ppm": round(baseline), "rise_ppm_per_min": round(rate, 1) if rate else None,
+        "minutes_to_limit": None, "interval_min": None,
+        "attention_hours": [h for h, v in hourly.items() if v >= CO2_ATTENTION],
+        "peak_hour": max(hourly, key=hourly.get) if hourly else None,
+        "typical_first_cross": f"{typical_cross // 60:02d}:{typical_cross % 60:02d}" if typical_cross is not None else None,
+        "days_crossed": len(first_cross),
+    }
+    if rate and baseline < limit:
+        plan["minutes_to_limit"] = round((limit - baseline) / rate)
+        # 기준에 닿기 전에 환기하도록 20% 여유를 두고 5분 단위로 내림 (최소 10분)
+        plan["interval_min"] = max(10, int(plan["minutes_to_limit"] * 0.8 // 5 * 5))
+    return plan
 
 
 # ---------------------------------------------------------------------------
 # 출력: Markdown
 # ---------------------------------------------------------------------------
-def to_markdown(title, src, coverage, metrics):
+def to_markdown(title, src, coverage, metrics, vent):
     L = [f"# {title}", "", f"- 데이터: `{os.path.basename(src)}`"]
     if coverage:
         L += [f"- 기간: {coverage['start']} ~ {coverage['end']}",
@@ -197,6 +281,43 @@ def to_markdown(title, src, coverage, metrics):
         if coverage["gaps"]:
             L.append(f"- 끊긴 구간 {len(coverage['gaps'])}곳: " +
                      ", ".join(f"{g['from'][5:16]}~{g['to'][5:16]}({g['hours']}h)" for g in coverage["gaps"][:5]))
+
+    # 리포트 맨 위: 기준 초과 경고
+    L += ["", "## ⚠️ 기준 초과 경고", ""]
+    warned = [m for m in metrics if m.get("warning")]
+    if not warned:
+        L.append("- 기준이 있는 항목(CO₂·온도·습도·미세먼지)을 찾지 못했습니다.")
+    for m in sorted(warned, key=lambda m: ["경고", "주의", "양호"].index(m["warning"]["level"])):
+        w = m["warning"]
+        line = f"- {w['icon']} **{m['label']} {w['level']}**: {w['reason']}"
+        if w["level"] != "양호":
+            d = 0 if m["key"] == "co2" else 1
+            lo, hi = m["limits"]
+            # 기준보다 낮아서 문제면 최저값, 높아서 문제면 최고값을 보여 준다
+            if lo is not None and m["min"] < lo:
+                line += f" · 최저 {fmt(m['min'], d)}{m['unit']}" + (f" ({m['min_at'][5:16]})" if m.get("min_at") else "")
+            if hi is not None and m["max"] > hi or (lo is None and m["key"] == "co2"):
+                line += f" · 최고 {fmt(m['max'], d)}{m['unit']}" + (f" ({m['max_at'][5:16]})" if m.get("max_at") else "")
+        L.append(line)
+
+    # 환기 시간 제안 (CO2가 있을 때만)
+    if vent:
+        L += ["", "## 🪟 환기 시간 제안", ""]
+        if not vent["days_crossed"]:
+            L.append(f"- CO₂가 {CO2_ATTENTION}ppm 이상으로 5분 넘게 이어진 적이 없어, 지금처럼 환기하면 충분합니다.")
+        else:
+            if vent["typical_first_cross"]:
+                L.append(f"- **첫 환기 시각:** 보통 **{vent['typical_first_cross']}쯤** CO₂가 {CO2_ATTENTION}ppm을 넘었습니다 "
+                         f"({vent['days_crossed']}일 중 중앙값). 이 시각 **전에** 첫 환기를 하세요.")
+            if vent["interval_min"]:
+                L.append(f"- **환기 간격:** 환기 직후(약 {vent['baseline_ppm']}ppm)부터 분당 약 {vent['rise_ppm_per_min']}ppm씩 올라 "
+                         f"**약 {vent['minutes_to_limit']}분 뒤 1,000ppm**에 닿습니다. → **{vent['interval_min']}분마다** 환기를 권장합니다.")
+            if vent["attention_hours"]:
+                hrs = ", ".join(f"{h:02d}시" for h in vent["attention_hours"])
+                L.append(f"- **특히 신경 쓸 시간대:** {hrs} (시간대 평균이 {CO2_ATTENTION}ppm 이상)"
+                         + (f" · 가장 높은 때 {vent['peak_hour']:02d}시" if vent["peak_hour"] is not None else ""))
+        L.append("- 환기는 창문을 마주 보게 두 군데 이상 열어 5~10분 하면 효과가 큽니다.")
+
     L += ["", "## 요약 통계", "", "| 항목 | 평균 | 중앙값 | 최소 | 최대 | 표준편차 | 기준 이탈 |",
           "|---|---|---|---|---|---|---|"]
     for m in metrics:
@@ -286,8 +407,15 @@ def svg_chart(m, width=440, height=220, max_points=800):
 
 def to_html(title, md_text, metrics):
     # Markdown 표·목록을 간단히 HTML로 바꾼다 (외부 라이브러리 없이)
-    body, in_table, in_list = [], False, False
+    body, in_table, in_list, in_box = [], False, False, False
     for line in md_text.splitlines():
+        # 경고·환기 섹션은 눈에 띄는 상자로 감싼다
+        if line.startswith("## ") and in_box:
+            if in_list:
+                body.append("</ul>")
+                in_list = False
+            body.append("</div>")
+            in_box = False
         esc = html.escape(line)
         esc = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", esc)
         esc = re.sub(r"`(.+?)`", r"<code>\1</code>", esc)
@@ -317,6 +445,10 @@ def to_html(title, md_text, metrics):
             body.append(line)
         elif line.startswith("## "):
             title_txt = esc[3:]
+            if title_txt.startswith(("⚠️", "🪟")):
+                worst = "warn" if "🔴" in md_text.split("## ⚠️", 1)[-1].split("\n## ", 1)[0] else "note"
+                body.append(f"<div class='box {worst if title_txt.startswith('⚠️') else 'vent'}'>")
+                in_box = True
             body.append(f"<h2>{title_txt}</h2>")
             if title_txt == "요약 통계":
                 body.append("<div class='charts'>" + "".join(
@@ -330,6 +462,8 @@ def to_html(title, md_text, metrics):
         body.append("</table>")
     if in_list:
         body.append("</ul>")
+    if in_box:
+        body.append("</div>")
     return f"""<!doctype html>
 <html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{html.escape(title)}</title>
@@ -348,6 +482,9 @@ figcaption {{ font-size:.9rem; color:var(--muted); }}
 svg {{ width:100%; height:auto; }} .grid {{ stroke:var(--line); }} .limit {{ stroke:#d4483b; stroke-dasharray:4 3; }}
 .axis {{ font-size:12px; fill:var(--muted); }} .muted {{ color:var(--muted); }}
 code {{ background:var(--line); padding:1px 4px; border-radius:4px; }}
+.box {{ border-radius:10px; padding:4px 16px 8px; margin-top:1.2rem; border:1px solid var(--line); background:var(--card); }}
+.box h2 {{ margin-top:.6rem; border:0; }}
+.box.warn {{ border-left:6px solid #d4483b; }} .box.note {{ border-left:6px solid #2e9d5b; }} .box.vent {{ border-left:6px solid #2f7fd1; }}
 </style></head><body><main>
 {chr(10).join(body)}
 </main></body></html>"""
@@ -378,14 +515,14 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     title = args.title or f"환경 데이터 분석 리포트 · {stem}"
 
-    coverage, metrics = analyze(rows, time_col, num_cols)
-    md = to_markdown(title, args.csv, coverage, metrics)
+    coverage, metrics, vent = analyze(rows, time_col, num_cols)
+    md = to_markdown(title, args.csv, coverage, metrics, vent)
     if args.insights:
         insights = open(args.insights, encoding="utf-8-sig").read().strip()
         md = md.replace("<!-- INSIGHTS -->", insights)
 
     summary = {"title": title, "source": os.path.abspath(args.csv), "time_column": time_col,
-               "coverage": coverage,
+               "coverage": coverage, "ventilation": vent,
                "metrics": [{k: v for k, v in m.items() if k != "series"} for m in metrics]}
     with open(os.path.join(out_dir, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2, default=str)
