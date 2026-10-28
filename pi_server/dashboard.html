@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>교실 환경 대시보드</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --text:#1d2433; --muted:#6b7385; --line:#e3e6ec;
+          --good:#2e9d5b; --warn:#d99a1e; --bad:#d4483b; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#14171d; --card:#1d2129; --text:#e8ebf1; --muted:#9aa2b1; --line:#2c313b; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+         font-family:system-ui,-apple-system,"Malgun Gothic",sans-serif; }
+  main { max-width:1100px; margin:0 auto; padding:20px 16px 40px; }
+  header { display:flex; flex-wrap:wrap; align-items:baseline; justify-content:space-between; gap:8px; }
+  h1 { font-size:1.4rem; margin:0; }
+  .meta { color:var(--muted); font-size:.9rem; }
+  .ranges button { border:1px solid var(--line); background:var(--card); color:var(--text);
+                   padding:4px 10px; border-radius:6px; cursor:pointer; }
+  .ranges button.on { background:var(--text); color:var(--bg); }
+  .tiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin:16px 0; }
+  .tile { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px; }
+  .tile .label { color:var(--muted); font-size:.85rem; }
+  .tile .value { font-size:1.8rem; font-weight:600; margin-top:4px; }
+  .tile .unit { font-size:.9rem; color:var(--muted); font-weight:400; }
+  .tile .badge { font-size:.8rem; margin-top:4px; }
+  .charts { display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:12px; }
+  .chart { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px; height:260px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>교실 환경 대시보드</h1>
+    <div class="ranges">
+      <button data-h="1">1시간</button><button data-h="6">6시간</button>
+      <button data-h="24" class="on">24시간</button><button data-h="168">7일</button><button data-h="100000">전체</button>
+    </div>
+  </header>
+  <div class="meta" id="meta">불러오는 중…</div>
+
+  <section class="tiles">
+    <div class="tile"><div class="label">CO₂</div><div class="value"><span id="v-co2">–</span> <span class="unit">ppm</span></div><div class="badge" id="b-co2"></div></div>
+    <div class="tile"><div class="label">온도</div><div class="value"><span id="v-temp">–</span> <span class="unit">°C</span></div></div>
+    <div class="tile"><div class="label">습도</div><div class="value"><span id="v-hum">–</span> <span class="unit">%</span></div></div>
+    <div class="tile"><div class="label">기압</div><div class="value"><span id="v-pres">–</span> <span class="unit">hPa</span></div></div>
+    <div class="tile"><div class="label">가스 저항 (VOC)</div><div class="value"><span id="v-gas">–</span> <span class="unit">kΩ</span></div><div class="badge" style="color:var(--muted)">낮을수록 공기 중 VOC 많음</div></div>
+  </section>
+
+  <section class="charts">
+    <div class="chart"><canvas id="c-co2"></canvas></div>
+    <div class="chart"><canvas id="c-temp"></canvas></div>
+    <div class="chart"><canvas id="c-hum"></canvas></div>
+    <div class="chart"><canvas id="c-gas"></canvas></div>
+  </section>
+</main>
+
+<script>
+// EMBEDDED_DATA: Netlify용 단일 HTML을 만들 때 이 값에 데이터 배열을 넣는다. null이면 파이 서버에서 실시간으로 가져온다.
+const EMBEDDED_DATA = null;
+
+let hours = 24;
+const charts = {};
+
+function co2Level(v) {
+  if (v < 1000) return ["좋음", "var(--good)"];
+  if (v < 2000) return ["환기 권장", "var(--warn)"];
+  return ["환기 필요", "var(--bad)"];
+}
+
+function makeChart(id, label, color) {
+  return new Chart(document.getElementById(id), {
+    type: "line",
+    data: { datasets: [{ label, data: [], borderColor: color, backgroundColor: color,
+                         pointRadius: 0, borderWidth: 2, tension: 0.2 }] },
+    options: { maintainAspectRatio: false, animation: false,
+               plugins: { legend: { labels: { color: getComputedStyle(document.body).color } } },
+               scales: { x: { type: "time", time: { tooltipFormat: "MM-dd HH:mm" } } } }
+  });
+}
+
+async function load() {
+  let rows;
+  if (EMBEDDED_DATA) {
+    const last = EMBEDDED_DATA.length ? new Date(EMBEDDED_DATA[EMBEDDED_DATA.length - 1].timestamp) : new Date();
+    rows = EMBEDDED_DATA.filter(r => new Date(r.timestamp) >= new Date(last - hours * 3600e3));
+  } else {
+    rows = await fetch(`/api/data?hours=${hours}`).then(r => r.json());
+  }
+  const num = (r, k) => r[k] === "" || r[k] == null ? null : Number(r[k]);
+  // 측정이 5분 넘게 끊긴 구간은 선을 잇지 않는다 (빈 칸으로 표시)
+  const series = k => {
+    const pts = [];
+    for (const r of rows) {
+      if (num(r, k) == null) continue;
+      const x = new Date(r.timestamp);
+      if (pts.length && x - pts[pts.length - 1].x > 5 * 60e3) pts.push({ x: new Date(x - 1), y: null });
+      pts.push({ x, y: num(r, k) });
+    }
+    return pts;
+  };
+
+  charts.co2.data.datasets[0].data = series("co2_ppm");
+  charts.temp.data.datasets[0].data = series("temp_c");
+  charts.hum.data.datasets[0].data = series("humidity");
+  charts.gas.data.datasets[0].data = series("gas_kohm");
+  Object.values(charts).forEach(c => c.update());
+
+  const last = rows[rows.length - 1];
+  if (!last) { document.getElementById("meta").textContent = "아직 데이터가 없어요."; return; }
+  const set = (id, v, d) => document.getElementById(id).textContent = v == null ? "–" : v.toFixed(d);
+  set("v-co2", num(last, "co2_ppm"), 0);
+  set("v-temp", num(last, "temp_c"), 1);
+  set("v-hum", num(last, "humidity"), 1);
+  set("v-pres", num(last, "pressure_hpa"), 1);
+  set("v-gas", num(last, "gas_kohm"), 1);
+  if (num(last, "co2_ppm") != null) {
+    const [txt, col] = co2Level(num(last, "co2_ppm"));
+    const b = document.getElementById("b-co2"); b.textContent = txt; b.style.color = col;
+  }
+  document.getElementById("meta").textContent =
+    `마지막 측정 ${last.timestamp.replace("T", " ")} · ${rows.length}건` + (EMBEDDED_DATA ? " (저장된 데이터)" : " · 30초마다 자동 갱신");
+}
+
+charts.co2 = makeChart("c-co2", "CO₂ (ppm)", "#d4483b");
+charts.temp = makeChart("c-temp", "온도 (°C)", "#e07b24");
+charts.hum = makeChart("c-hum", "습도 (%)", "#2f7fd1");
+charts.gas = makeChart("c-gas", "가스 저항 (kΩ)", "#7a5bd1");
+
+document.querySelectorAll(".ranges button").forEach(btn => btn.onclick = () => {
+  document.querySelectorAll(".ranges button").forEach(b => b.classList.remove("on"));
+  btn.classList.add("on"); hours = Number(btn.dataset.h); load();
+});
+
+// Netlify(저장된 데이터)에서는 처음에 전체 기간을 보여 준다
+if (EMBEDDED_DATA) {
+  hours = 100000;
+  document.querySelectorAll(".ranges button").forEach(b => b.classList.toggle("on", b.dataset.h === "100000"));
+}
+load();
+if (!EMBEDDED_DATA) setInterval(load, 30000);
+</script>
+</body>
+</html>

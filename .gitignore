@@ -1,0 +1,11 @@
+# Arduino 보드 드라이버 (Arduino 코어에서 복사한 설치 파일 - 저장소에 넣지 않음)
+drivers/
+
+# 파이썬 캐시
+__pycache__/
+*.pyc
+
+# 파이에서 쌓이는 원본 데이터·로그 (샘플은 sample_data/에 있음)
+pi_server/env_data.csv
+pi_server/*.log
+pi_server/dashboard/
